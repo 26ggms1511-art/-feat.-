@@ -1,20 +1,20 @@
-'use strict';
+'엄격하게 사용하라';;
 // ============================================================
 //  친구 배신 게임 - 클라이언트 (그리기 / 조작 / UI)
 //  게임 규칙과 점수는 전부 서버가 계산한다. 여기서는 보여주기만 함.
 // ============================================================
-(() => {
-const $ = (s) => document.querySelector(s);
-const socket = io();
+(() => {() => {
+const $ = (s) => document.querySelector(s); $ = (s) => document.querySelector(s);
+const socket = io(); socket = io();
 
-const RES = ['wood', 'stone', 'food', 'part', 'gem'];
-const RE = { wood: '🪵', stone: '🪨', food: '🍎', part: '⚙️', gem: '💎' };
-const RN = { wood: '나무', stone: '돌', food: '음식', part: '부품', gem: '보석' };
-const NODE_E = { wood: '🌳', stone: '🪨', food: '🍎', part: '⚙️', gem: '💎', chest: '🎁' };
-const ZONE_COLOR = { forest: '#9fe08c', mine: '#cdcdda', beach: '#fbe7a6', ruins: '#dcc7ec', hazard: '#ffa684' };
-const ITEM_KEYS = ['axe', 'armor', 'shield', 'trap', 'hook'];
+const RES = ['wood', 'stone', 'food', 'part', 'gem']; RES = ['wood', 'stone', 'food', 'part', 'gem'];
+const RE = { 목재: '🪵', 돌: '🪨', 음식: '🍎', 부분: '⚙️', 보석: '💎' }; RE = { 목재: '🪵', 돌: '🪨', 음식: '🍎', 부분: '⚙️', 보석: '💎' };
+const RN = { wood: '나무', stone: '돌', food: '음식', part: '부품', gem: '보석' }; RN = { wood: '나무', stone: '돌', food: '음식', part: '부품', gem: '보석' };
+const NODE_E = { 목재: '🌳', 돌: '🪨', 음식: '🍎', 부분: '⚙️', 보석: '💎', 가슴: '🎁' }; NODE_E = { 목재: '🌳', 돌: '🪨', 음식: '🍎', 부분: '⚙️', 보석: '💎', 가슴: '🎁' };
+const ZONE_COLOR = { forest: '#9fe08c', mine: '#cdcddda', beach: '#fbe7a6', ruins: '#dcc7ec', hazard: '#ffa684' }; ZONE_COLOR = { forest: '#9fe08c', mine: '#cdcddda', beach: '#fbe7a6', ruins: '#dcc7ec', hazard: '#ffa684' };
+const ITEM_KEYS = ['axe', 'armor', 'shield', 'trap', 'hook']; ITEM_KEYS = ['axe', 'armor', 'shield', 'trap', 'hook'];
 
-let session = null;
+let session = null; session = null;
 try { session = JSON.parse(sessionStorage.getItem('betray-session') || 'null'); } catch (e) { session = null; }
 let pid = session ? session.pid : null;
 let cfg = null, S = null, nodes = [], lobby = null, playing = false;
