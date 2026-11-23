@@ -1,0 +1,642 @@
+'use strict';
+// ============================================================
+//  친구 배신 게임 - 클라이언트 (그리기 / 조작 / UI)
+//  게임 규칙과 점수는 전부 서버가 계산한다. 여기서는 보여주기만 함.
+// ============================================================
+(() => {
+const $ = (s) => document.querySelector(s);
+const socket = io();
+
+const RES = ['wood', 'stone', 'food', 'part', 'gem'];
+const RE = { wood: '🪵', stone: '🪨', food: '🍎', part: '⚙️', gem: '💎' };
+const RN = { wood: '나무', stone: '돌', food: '음식', part: '부품', gem: '보석' };
+const NODE_E = { wood: '🌳', stone: '🪨', food: '🍎', part: '⚙️', gem: '💎', chest: '🎁' };
+const ZONE_COLOR = { forest: '#9fe08c', mine: '#cdcdda', beach: '#fbe7a6', ruins: '#dcc7ec', hazard: '#ffa684' };
+const ITEM_KEYS = ['axe', 'armor', 'shield', 'trap', 'hook'];
+
+let session = null;
+try { session = JSON.parse(sessionStorage.getItem('betray-session') || 'null'); } catch (e) { session = null; }
+let pid = session ? session.pid : null;
+let cfg = null, S = null, nodes = [], lobby = null, playing = false;
+let results = null;
+const pos = new Map();
+let reqs = [];
+let logs = [];
+let chats = [];
+let panel = null, panelData = null, panelSig = '';
+let specPid = null;
+const cam = { x: 900, y: 600 };
+
+// ---------- 화면 전환 ----------
+function screen(name) {
+  for (const el of document.querySelectorAll('.screen')) el.classList.toggle('hidden', el.id !== 'screen-' + name);
+}
+function saveSession(s) {
+  session = s; pid = s ? s.pid : null;
+  try { if (s) sessionStorage.setItem('betray-session', JSON.stringify(s)); else sessionStorage.removeItem('betray-session'); } catch (e) { /* ignore */ }
+}
+function msg(t) { $('#menu-msg').textContent = t || ''; }
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// ---------- 메뉴 ----------
+try { $('#inp-name').value = localStorage.getItem('betray-name') || ''; } catch (e) { /* ignore */ }
+const qRoom = new URLSearchParams(location.search).get('room');
+if (qRoom) $('#inp-code').value = qRoom.toUpperCase().slice(0, 5);
+
+function getName() {
+  const n = $('#inp-name').value.trim();
+  if (!n) { msg('이름을 먼저 입력해줘!'); return null; }
+  try { localStorage.setItem('betray-name', n); } catch (e) { /* ignore */ }
+  return n;
+}
+function onJoined(res) {
+  if (!res || !res.ok) return msg((res && res.error) || '연결에 실패했어. 다시 시도해줘!');
+  saveSession({ code: res.code, pid: res.pid, token: res.token });
+  msg('');
+}
+$('#btn-create').onclick = () => { const name = getName(); if (name) socket.emit('create', { name }, onJoined); };
+$('#btn-join').onclick = () => {
+  const name = getName(); if (!name) return;
+  const code = $('#inp-code').value.trim().toUpperCase();
+  if (code.length < 5) return msg('방 코드 5자리를 입력해줘!');
+  socket.emit('join', { name, code }, onJoined);
+};
+$('#btn-leave').onclick = leave;
+$('#btn-end-leave').onclick = leave;
+function leave() {
+  socket.emit('leave');
+  saveSession(null); playing = false; S = null; results = null; lobby = null;
+  screen('menu');
+}
+$('#btn-start').onclick = () => socket.emit('start');
+$('#btn-rematch').onclick = () => socket.emit('rematch');
+$('#btn-copy').onclick = async () => {
+  if (!lobby) return;
+  const url = `${location.origin}/?room=${lobby.code}`;
+  const text = `친구 배신 게임 같이 하자! 방 코드: ${lobby.code}\n${url}`;
+  try {
+    if (navigator.share) { await navigator.share({ title: '친구 배신 게임', text, url }); return; }
+  } catch (e) { /* 공유 취소 */ }
+  try { await navigator.clipboard.writeText(text); $('#lobby-msg').textContent = '초대 링크를 복사했어! 친구에게 보내줘 👍'; }
+  catch (e) { $('#lobby-msg').textContent = `링크: ${url}`; }
+};
+
+// ---------- 소켓 이벤트 ----------
+socket.on('connect', () => {
+  if (session) {
+    socket.emit('rejoin', session, (res) => {
+      if (!res || !res.ok) { saveSession(null); playing = false; screen('menu'); }
+    });
+  }
+});
+socket.on('kicked', () => { saveSession(null); playing = false; screen('menu'); msg('다른 화면에서 접속해서 이 화면은 종료됐어.'); });
+socket.on('lobby', (d) => {
+  lobby = d; playing = false; results = null; closePanel();
+  screen('lobby');
+  $('#lobby-code').textContent = d.code;
+  $('#lobby-count').textContent = `(${d.players.length}/8)`;
+  $('#lobby-list').innerHTML = d.players.map((p) =>
+    `<li class="${p.on ? '' : 'off'}">${p.emoji} ${esc(p.name)} ${p.pid === d.host ? '👑' : ''} ${p.pid === pid ? '(나)' : ''}${p.on ? '' : ' 💤'}</li>`).join('');
+  const isHost = d.host === pid;
+  $('#btn-start').classList.toggle('hidden', !isHost);
+  $('#lobby-wait').classList.toggle('hidden', isHost);
+  $('#btn-start').disabled = d.players.filter((p) => p.on).length < 2;
+  $('#btn-start').textContent = $('#btn-start').disabled ? '2명 이상 모여야 시작해요' : '▶ 게임 시작';
+});
+socket.on('started', (c) => {
+  cfg = c; playing = true; results = null; reqs = []; logs = []; chats = []; pos.clear(); S = null; specPid = null;
+  closePanel(); renderReqs();
+  screen('game'); resize();
+});
+socket.on('nodes', (l) => { nodes = l; });
+socket.on('state', onState);
+socket.on('toast', (t) => showToast(t.text, t.kind));
+socket.on('log', (l) => { pushLog(l.text, false); });
+socket.on('chat', (c) => {
+  chats.push(c); if (chats.length > 60) chats.shift();
+  pushLog(`${c.ghost ? '👻' : c.emoji} ${c.name}${c.scope === 'ally' ? '(동맹)' : ''}: ${c.text}`, true);
+  if (panel === 'chat') renderPanel(true);
+});
+socket.on('tradeReq', (r) => { reqs = reqs.filter((x) => x.id !== r.id); reqs.push({ kind: 'trade', id: r.id, from: r.from, name: r.name, emoji: r.emoji, give: r.give, want: r.want, at: Date.now() }); renderReqs(); buzz(); });
+socket.on('tradeEnd', (r) => { reqs = reqs.filter((x) => x.id !== r.id); renderReqs(); });
+socket.on('allyReq', (r) => { reqs = reqs.filter((x) => !(x.kind === 'ally' && x.from === r.from)); reqs.push({ kind: 'ally', id: 'a' + r.from, from: r.from, name: r.name, emoji: r.emoji, at: Date.now() }); renderReqs(); buzz(); });
+socket.on('ended', (r) => { results = r; playing = false; closePanel(); showEnd(); });
+
+function buzz() { try { if (navigator.vibrate) navigator.vibrate(60); } catch (e) { /* ignore */ } }
+
+// ---------- 토스트/로그 ----------
+function showToast(text, kind) {
+  const d = document.createElement('div');
+  d.className = 'toast ' + (kind || '');
+  d.textContent = text;
+  const box = $('#toasts');
+  box.appendChild(d);
+  while (box.children.length > 4) box.removeChild(box.firstChild);
+  setTimeout(() => d.remove(), 3200);
+}
+function pushLog(text, isChat) {
+  logs.push({ text, isChat, at: Date.now() });
+  if (logs.length > 30) logs.shift();
+  renderLog();
+}
+function renderLog() {
+  const now = Date.now();
+  logs = logs.filter((l) => now - l.at < 12000);
+  $('#log').innerHTML = logs.slice(-5).map((l) => `<div class="${l.isChat ? 'chat' : ''}">${esc(l.text)}</div>`).join('');
+}
+setInterval(() => { if (playing) renderLog(); }, 1500);
+
+function renderReqs() {
+  const now = Date.now();
+  reqs = reqs.filter((r) => now - r.at < 30000);
+  $('#reqs').innerHTML = reqs.map((r) => {
+    if (r.kind === 'trade') {
+      return `<div class="req">🔄 ${r.emoji} ${esc(r.name)} 의 거래 제안<br>줄게: ${bundleStr(r.give)}<br>받고 싶어: ${bundleStr(r.want)}
+      <div class="rbtns"><button data-ui="trade-yes" data-id="${esc(r.id)}">수락</button><button class="no" data-ui="trade-no" data-id="${esc(r.id)}">거절</button></div></div>`;
+    }
+    return `<div class="req">🤝 ${r.emoji} ${esc(r.name)} 이(가) 동맹을 제안했어!
+      <div class="rbtns"><button data-ui="ally-yes" data-from="${esc(r.from)}">수락</button><button class="no" data-ui="ally-no" data-from="${esc(r.from)}">거절</button></div></div>`;
+  }).join('');
+}
+setInterval(() => { if (reqs.length) renderReqs(); }, 2000);
+function bundleStr(b) { return RES.filter((k) => b[k] > 0).map((k) => `${RE[k]}${b[k]}`).join(' ') || '없음 (선물)'; }
+
+// ---------- 상태 수신 ----------
+function onState(s) {
+  S = s;
+  const seen = new Set();
+  for (const p of s.players) {
+    if (p.x === undefined) continue;
+    seen.add(p.id);
+    const q = pos.get(p.id);
+    if (!q) pos.set(p.id, { x: p.x, y: p.y, tx: p.x, ty: p.y });
+    else { q.tx = p.x; q.ty = p.y; }
+  }
+  for (const id of [...pos.keys()]) if (!seen.has(id)) pos.delete(id);
+  updateHUD();
+  if (panel) renderPanel(false);
+}
+const meP = () => (S ? S.players.find((p) => p.id === pid) : null);
+
+function fmtTime(sec) { sec = Math.max(0, Math.ceil(sec)); return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`; }
+function updateHUD() {
+  const m = S.me;
+  $('#hp-fill').style.width = Math.max(0, m.hp) + '%';
+  $('#hp-text').textContent = `❤️ ${m.hp}${m.shieldLeft ? ` 🔮${m.shieldLeft}s` : ''}`;
+  $('#hud-phase').textContent = S.phase === 'night' ? '🌙' : '☀️';
+  $('#hud-time').textContent = fmtTime(cfg.dur - S.t);
+  $('#hud-code').textContent = session ? session.code : '';
+  $('#hud-score').textContent = m.score;
+  $('#hud-camp').textContent = S.camp.lv;
+  $('#res-line').textContent = RES.map((k) => `${RE[k]}${m.inv[k]}`).join(' ');
+  const eb = $('#event-banner');
+  if (S.ev) { eb.classList.remove('hidden'); eb.textContent = `${S.ev.name} ${S.ev.left}s`; } else eb.classList.add('hidden');
+  const si = $('#ship-info');
+  if (S.ship.active && !S.ship.departed) { si.classList.remove('hidden'); si.textContent = `🚢 탈출선 ${S.ship.boarded}/${S.ship.seats}명 · ${S.ship.left}s`; }
+  else si.classList.add('hidden');
+  const dead = meP() && !meP().a;
+  $('#btn-spec').classList.toggle('hidden', !dead);
+  const c = ctxAction();
+  const mb = $('#btn-main');
+  mb.textContent = c.label; mb.classList.toggle('dim', !c.run);
+}
+
+// ---------- 컨텍스트 행동 버튼 ----------
+const act = (type, extra) => socket.emit('act', Object.assign({ type }, extra || {}));
+function myPos() { return pos.get(pid); }
+function ctxAction() {
+  const me = meP();
+  if (!S || !me) return { label: '🖐 채집' };
+  if (!me.a) return { label: '👻 관전 중' };
+  if (me.bd) return { label: '⛵ 탑승 완료!' };
+  const mp = myPos();
+  if (!mp) return { label: '🖐 채집' };
+  if (S.ship.active && !S.ship.departed && Math.hypot(mp.x - cfg.DOCK.x, mp.y - cfg.DOCK.y) <= 100) return { label: '⛵ 탑승하기', run: () => act('board') };
+  let best = null, bd = 68;
+  for (const n of nodes) { const d = Math.hypot(mp.x - n[2], mp.y - n[3]); if (d < bd) { bd = d; best = n; } }
+  if (best) return { label: `${NODE_E[best[1]]} 채집하기`, run: () => act('collect') };
+  if (Math.hypot(mp.x - cfg.CAMP.x, mp.y - cfg.CAMP.y) <= 150) return { label: '🏕️ 캠프 열기', run: () => openPanel('camp') };
+  return { label: '🖐 채집 (자원 근처에서!)' };
+}
+$('#btn-main').addEventListener('pointerdown', (e) => { e.preventDefault(); const c = ctxAction(); if (c.run) c.run(); else showToast('자원 가까이로 이동해서 눌러봐!'); });
+
+// ---------- 조작 ----------
+const keys = {};
+let joyV = { x: 0, y: 0 };
+addEventListener('keydown', (e) => {
+  if (e.target && e.target.tagName === 'INPUT') { if (e.key === 'Enter' && panel === 'chat') sendChat(); return; }
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  if (!playing) return;
+  if (k === 'e' || k === ' ') { e.preventDefault(); const c = ctxAction(); if (c.run) c.run(); }
+  if (k === 'i') togglePanel('inv');
+  if (k === 'p') togglePanel('players');
+  if (k === 'c') togglePanel('camp');
+  if (k === 'm') togglePanel('mission');
+  if (k === 'enter') togglePanel('chat');
+  if (k === 'escape') closePanel();
+});
+addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+const joy = $('#joy'), knob = $('#knob');
+let joyId = null;
+function joyMove(e) {
+  const r = joy.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  let dx = (e.clientX - cx) / (r.width / 2), dy = (e.clientY - cy) / (r.height / 2);
+  const len = Math.hypot(dx, dy);
+  if (len > 1) { dx /= len; dy /= len; }
+  joyV = { x: Math.abs(dx) < 0.12 ? 0 : dx, y: Math.abs(dy) < 0.12 ? 0 : dy };
+  knob.style.transform = `translate(${dx * r.width * 0.32}px, ${dy * r.height * 0.32}px)`;
+}
+joy.addEventListener('pointerdown', (e) => { e.preventDefault(); joyId = e.pointerId; joy.setPointerCapture(e.pointerId); joyMove(e); });
+joy.addEventListener('pointermove', (e) => { if (e.pointerId === joyId) joyMove(e); });
+const joyEnd = (e) => { if (e.pointerId === joyId) { joyId = null; joyV = { x: 0, y: 0 }; knob.style.transform = ''; } };
+joy.addEventListener('pointerup', joyEnd);
+joy.addEventListener('pointercancel', joyEnd);
+
+let lastSent = { x: 0, y: 0 }, lastSentAt = 0;
+setInterval(() => {
+  if (!playing || !S) return;
+  let x = joyV.x, y = joyV.y;
+  if (keys['a'] || keys['arrowleft']) x -= 1;
+  if (keys['d'] || keys['arrowright']) x += 1;
+  if (keys['w'] || keys['arrowup']) y -= 1;
+  if (keys['s'] || keys['arrowdown']) y += 1;
+  const len = Math.hypot(x, y);
+  if (len > 1) { x /= len; y /= len; }
+  x = Math.round(x * 100) / 100; y = Math.round(y * 100) / 100;
+  const moving = x !== 0 || y !== 0;
+  const changed = x !== lastSent.x || y !== lastSent.y;
+  const now = Date.now();
+  if (changed || (moving && now - lastSentAt > 200)) { socket.emit('input', { x, y }); lastSent = { x, y }; lastSentAt = now; }
+}, 60);
+
+// ---------- 패널 ----------
+document.body.addEventListener('click', onUIClick);
+document.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('pointerdown', (e) => { e.preventDefault(); togglePanel(b.dataset.open); }));
+$('#btn-spec').addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  if (!S) return;
+  const alive = S.players.filter((p) => p.a && p.x !== undefined);
+  if (!alive.length) return;
+  const i = alive.findIndex((p) => p.id === specPid);
+  specPid = alive[(i + 1) % alive.length].id;
+  showToast(`👁 ${alive[(i + 1) % alive.length].n} 관전 중`);
+});
+function togglePanel(name) { if (panel === name) closePanel(); else openPanel(name); }
+function openPanel(name, data) { panel = name; panelData = data || null; panelSig = ''; $('#panel').classList.remove('hidden'); renderPanel(true); }
+function closePanel() { panel = null; panelData = null; $('#panel').classList.add('hidden'); }
+
+function renderPanel(force) {
+  if (!panel || !S) return;
+  const titles = { inv: '🎒 가방 · 만들기', players: '👥 친구들', camp: '🏕️ 캠프', mission: '🎯 비밀 미션', chat: '💬 채팅', trade: '🔄 거래 제안', betray: '😈 배신' };
+  $('#panel-title').textContent = titles[panel] || '';
+  let html = '';
+  if (panel === 'inv') html = invHTML();
+  else if (panel === 'players') html = playersHTML();
+  else if (panel === 'camp') html = campHTML();
+  else if (panel === 'mission') html = missionHTML();
+  else if (panel === 'betray') html = betrayHTML();
+  else if (panel === 'trade') { if (force) { $('#panel-body').innerHTML = tradeHTML(); } return; }
+  else if (panel === 'chat') { if (force) { chatRender(); } return; }
+  const body = $('#panel-body');
+  if (force || html !== panelSig) { const st = body.scrollTop; body.innerHTML = html; body.scrollTop = st; panelSig = html; }
+}
+
+function invHTML() {
+  const m = S.me, inv = m.inv;
+  let h = `<div class="chips">${RES.map((k) => `<span class="chip">${RE[k]} ${RN[k]} ${inv[k]}</span>`).join('')}</div>`;
+  h += `<h4>보유 아이템</h4><div class="chips">`;
+  for (const k of ITEM_KEYS) { const r = cfg.recipes[k]; h += `<span class="chip ${inv[k] ? 'ok' : ''}">${r.emoji} ${r.name} ${inv[k]}</span>`; }
+  h += `</div>`;
+  h += `<div class="item-row"><div class="info"><b>🍎 음식 먹기</b><small>체력 +20 (음식 ${inv.food}개)</small></div><button class="ib green" data-ui="eat" ${inv.food < 1 || m.hp >= 100 ? 'disabled' : ''}>먹기</button></div>`;
+  h += `<div class="item-row"><div class="info"><b>🔮 방어막 사용</b><small>25초간 피해·도난 방지 (${inv.shield}개)${m.shieldLeft ? ` · 남음 ${m.shieldLeft}s` : ''}</small></div><button class="ib" data-ui="shield" ${inv.shield < 1 ? 'disabled' : ''}>사용</button></div>`;
+  h += `<div class="item-row"><div class="info"><b>🪤 함정 설치</b><small>지금 서 있는 곳에 설치 (${inv.trap}개) · 캠프 밖에서만</small></div><button class="ib" data-ui="trap" ${inv.trap < 1 ? 'disabled' : ''}>설치</button></div>`;
+  h += `<h4>🔨 만들기</h4>`;
+  for (const k of ITEM_KEYS) {
+    const r = cfg.recipes[k];
+    const enough = Object.keys(r.cost).every((x) => inv[x] >= r.cost[x]);
+    const maxed = inv[k] >= r.max;
+    const cost = Object.keys(r.cost).map((x) => `${RE[x]}${r.cost[x]}`).join(' ');
+    h += `<div class="item-row"><div class="info"><b>${r.emoji} ${r.name}</b><small>${r.desc}</small><small>재료: ${cost}</small></div><button class="ib pink" data-ui="craft" data-item="${k}" ${!enough || maxed ? 'disabled' : ''}>${maxed ? '최대' : '만들기'}</button></div>`;
+  }
+  return h;
+}
+
+function playersHTML() {
+  const me = meP();
+  const alive = me && me.a && !me.bd;
+  const mp = myPos();
+  let h = '';
+  const others = S.players.filter((p) => p.id !== pid);
+  if (!others.length) return '<div class="sub">다른 플레이어가 없어요</div>';
+  for (const p of others) {
+    const q = pos.get(p.id);
+    const near = !!(mp && q && Math.hypot(mp.x - q.x, mp.y - q.y) <= 110);
+    const isAlly = S.me.allies.includes(p.id);
+    const status = [!p.a ? '💀 탈락' : '', p.bd ? '⛵ 탑승' : '', p.bt ? `😈 배신자 ${p.bt}s` : '', isAlly ? '🤝 동맹' : '', !p.on ? '💤 오프라인' : ''].filter(Boolean).join(' · ');
+    const can = alive && p.a && !p.bd;
+    h += `<div class="item-row"><div class="info"><b>${p.e} ${esc(p.n)} <span class="mini-hp"><i style="width:${p.hp}%"></i></span></b><small>${status || '생존 중'}</small></div>`;
+    if (can) {
+      h += isAlly
+        ? `<button class="ib" data-ui="ally-break" data-to="${p.id}">💔</button>`
+        : `<button class="ib green" data-ui="ally-req" data-to="${p.id}">🤝</button>`;
+      h += `<button class="ib" data-ui="trade-open" data-to="${p.id}">🔄</button>`;
+      h += `<button class="ib red" data-ui="betray-open" data-to="${p.id}" data-near="${near ? 1 : 0}">😈</button>`;
+    }
+    h += `</div>`;
+  }
+  h += `<div class="sub">🤝 동맹 · 🔄 거래 · 😈 배신 메뉴</div>`;
+  return h;
+}
+
+function betrayHTML() {
+  const t = S.players.find((p) => p.id === panelData);
+  if (!t) return '<div class="sub">상대를 찾을 수 없어요</div>';
+  const mp = myPos(), q = pos.get(t.id);
+  const near = !!(mp && q && Math.hypot(mp.x - q.x, mp.y - q.y) <= 105);
+  const isAlly = S.me.allies.includes(t.id);
+  const inv = S.me.inv;
+  let h = `<div class="item-row"><div class="info"><b>${t.e} ${esc(t.n)}</b><small>${isAlly ? '🤝 동맹 중' : '동맹 아님'} · ${near ? '✅ 가까이 있음' : '❌ 너무 멀어 (갈고리는 가까이서만)'}</small></div></div>`;
+  h += `<div class="item-row"><div class="info"><b>💔 동맹 해제</b><small>점수는 없지만 해제 직후 10초 안에 훔치면 배신으로 인정돼</small></div><button class="ib" data-ui="ally-break" data-to="${t.id}" ${isAlly ? '' : 'disabled'}>해제</button></div>`;
+  h += `<div class="item-row"><div class="info"><b>🪝 갈고리로 훔치기</b><small>자원 최대 3개 · 갈고리 ${inv.hook}개${S.me.hookCd ? ` · 대기 ${S.me.hookCd}s` : ''}</small></div><button class="ib red" data-ui="hook" data-to="${t.id}" ${inv.hook < 1 || !near || S.me.hookCd ? 'disabled' : ''}>훔치기</button></div>`;
+  h += `<div class="item-row"><div class="info"><b>🪤 함정 설치</b><small>내 자리에 설치 (${inv.trap}개). 동맹 중에 설치하고 → 동맹 해제 → 상대가 밟으면 배신 성공!</small></div><button class="ib" data-ui="trap" ${inv.trap < 1 ? 'disabled' : ''}>설치</button></div>`;
+  h += `<div class="sub">😈 배신에 성공하면 +150점(최대 2번). 하지만 모두에게 공개되고 90초간 동맹을 맺을 수 없어!</div>`;
+  return h;
+}
+
+function campHTML() {
+  const mp = myPos();
+  const inCamp = !!(mp && Math.hypot(mp.x - cfg.CAMP.x, mp.y - cfg.CAMP.y) <= 150);
+  const lv = S.camp.lv, inv = S.me.inv, pool = S.camp.pool;
+  const eff = ['', '기본 캠프 (회복 2/초)', '체력 회복 속도 증가 (5/초)', '상점 활성화 (3개 → 1개 교환)', '안전지역 확대', '탈출선 활성화!'];
+  let h = `<div class="chips"><span class="chip ok">현재 Lv.${lv}</span><span class="chip">${eff[lv]}</span></div>`;
+  if (lv < 5) {
+    const cost = cfg.campCost[lv + 1];
+    h += `<h4>Lv.${lv + 1} 업그레이드 (${eff[lv + 1]})</h4><div class="chips">`;
+    for (const k of Object.keys(cost)) h += `<span class="chip ${pool[k] >= cost[k] ? 'ok' : ''}">${RE[k]} ${pool[k]}/${cost[k]}</span>`;
+    h += `</div><div class="sub">모든 재료가 모이면 자동으로 업그레이드! 모두에게 이득이야.</div>`;
+  } else h += `<div class="sub">최고 레벨! 탈출선으로 가자 🚢</div>`;
+  h += `<h4>자원 넣기 ${inCamp ? '' : '(캠프 안에서만 가능)'}</h4>`;
+  for (const k of RES) {
+    h += `<div class="item-row"><div class="info"><b>${RE[k]} ${RN[k]}</b><small>내 보유 ${inv[k]}</small></div>
+      <button class="ib" data-ui="deposit" data-res="${k}" data-n="1" ${!inCamp || inv[k] < 1 ? 'disabled' : ''}>+1</button>
+      <button class="ib" data-ui="deposit" data-res="${k}" data-n="5" ${!inCamp || inv[k] < 5 ? 'disabled' : ''}>+5</button></div>`;
+  }
+  if (lv >= 3) {
+    h += `<h4>🛒 상점 (3개 → 1개 교환)</h4><div class="item-row"><select id="ex-from">${RES.map((k) => `<option value="${k}">${RE[k]} ${RN[k]} 3개</option>`).join('')}</select>→
+      <select id="ex-to">${RES.map((k, i) => `<option value="${k}" ${i === 3 ? 'selected' : ''}>${RE[k]} ${RN[k]} 1개</option>`).join('')}</select>
+      <button class="ib pink" data-ui="exchange" ${inCamp ? '' : 'disabled'}>교환</button></div>`;
+  }
+  return h;
+}
+
+function missionHTML() {
+  const m = S.me.mission;
+  return `<div class="item-row"><div class="info"><b>${m.done ? '✅' : '🎯'} ${esc(m.text)}</b><small>진행 ${m.cur}/${m.goal} · 성공 시 +200점 (다른 사람에겐 비밀!)</small></div></div>
+  <div class="bar"><i style="width:${Math.min(100, (m.cur / m.goal) * 100)}%"></i></div>
+  <h4>⭐ 점수 규칙</h4>
+  <table class="tbl"><tr><td>생존</td><td>+100</td></tr><tr><td>탈출선 탑승</td><td>+300</td></tr><tr><td>비밀 미션</td><td>+200</td></tr>
+  <tr><td>보석 3개마다</td><td>+100 (최대 300)</td></tr><tr><td>캠프에 10개 이상 기여</td><td>+50</td></tr>
+  <tr><td>동맹 60초 유지마다</td><td>+30 (최대 120)</td></tr><tr><td>배신 성공</td><td>+150 (최대 2번)</td></tr></table>
+  <div class="sub">내 점수: ⭐ ${S.me.score} (생존·탈출 점수는 게임이 끝나야 더해져)</div>`;
+}
+
+function tradeHTML() {
+  const t = S.players.find((p) => p.id === panelData);
+  if (!t) return '<div class="sub">상대를 찾을 수 없어요</div>';
+  const inp = (pref) => RES.map((k) => `<div>${RE[k]}<input type="number" min="0" max="50" value="0" inputmode="numeric" data-${pref}="${k}"></div>`).join('');
+  return `<div><b>${t.e} ${esc(t.n)}</b> 에게 제안하기</div>
+  <h4>내가 줄 것</h4><div class="trade-grid">${inp('give')}</div>
+  <h4>받고 싶은 것</h4><div class="trade-grid">${inp('want')}</div>
+  <div class="sub">동맹끼리 거래하면 보너스 자원을 더 받아! (서로 거리가 400 이내여야 해)</div>
+  <button class="btn" data-ui="trade-send" data-to="${t.id}">📨 제안 보내기</button>`;
+}
+
+function chatRender() {
+  $('#panel-body').innerHTML = `<div class="chat-box" id="chat-box">${chats.map((c) => `<div>${c.ghost ? '👻' : c.emoji} <b>${esc(c.name)}</b>${c.scope === 'ally' ? ' <small>(동맹)</small>' : ''}: ${esc(c.text)}</div>`).join('') || '<div class="sub">아직 대화가 없어요</div>'}</div>
+  <div class="chat-send"><select id="chat-scope"><option value="all">전체</option><option value="ally">동맹</option></select><input id="chat-inp" maxlength="80" placeholder="메시지..." autocomplete="off"><button class="ib pink" data-ui="chat-send">보내기</button></div>`;
+  const b = $('#chat-box'); if (b) b.scrollTop = b.scrollHeight;
+}
+function sendChat() {
+  const i = $('#chat-inp'); if (!i) return;
+  const text = i.value.trim(); if (!text) return;
+  socket.emit('chat', { text, scope: $('#chat-scope').value });
+  i.value = '';
+}
+
+function readBundle(attr) {
+  const o = {};
+  document.querySelectorAll(`[data-${attr}]`).forEach((el) => { o[el.dataset[attr]] = Math.max(0, Math.min(50, Math.floor(Number(el.value) || 0))); });
+  return o;
+}
+
+function onUIClick(e) {
+  const el = e.target.closest('[data-ui],[data-close]');
+  if (!el) return;
+  if (el.dataset.close) return closePanel();
+  const d = el.dataset;
+  switch (d.ui) {
+    case 'eat': act('eat'); break;
+    case 'shield': act('shield'); break;
+    case 'trap': act('trap'); break;
+    case 'craft': act('craft', { item: d.item }); break;
+    case 'deposit': act('deposit', { res: d.res, n: Number(d.n) }); break;
+    case 'exchange': act('exchange', { from: $('#ex-from').value, to: $('#ex-to').value }); break;
+    case 'ally-req': act('allyReq', { to: d.to }); break;
+    case 'ally-break': act('allyBreak', { to: d.to }); break;
+    case 'hook': act('hook', { to: d.to }); break;
+    case 'trade-open': openPanel('trade', d.to); break;
+    case 'betray-open': openPanel('betray', d.to); break;
+    case 'trade-send': act('trade', { to: d.to, give: readBundle('give'), want: readBundle('want') }); closePanel(); break;
+    case 'trade-yes': act('tradeReply', { id: d.id, accept: true }); reqs = reqs.filter((r) => r.id !== d.id); renderReqs(); break;
+    case 'trade-no': act('tradeReply', { id: d.id, accept: false }); reqs = reqs.filter((r) => r.id !== d.id); renderReqs(); break;
+    case 'ally-yes': act('allyReply', { from: d.from, accept: true }); reqs = reqs.filter((r) => !(r.kind === 'ally' && r.from === d.from)); renderReqs(); break;
+    case 'ally-no': act('allyReply', { from: d.from, accept: false }); reqs = reqs.filter((r) => !(r.kind === 'ally' && r.from === d.from)); renderReqs(); break;
+    case 'chat-send': sendChat(); break;
+    default: break;
+  }
+}
+
+// ---------- 결과 화면 ----------
+function showEnd() {
+  screen('end');
+  const r = results; if (!r) return;
+  const medals = ['🥇', '🥈', '🥉'];
+  const w = r.rows[0];
+  $('#end-title').textContent = r.reason === 'ship' ? '🚢 탈출선이 떠났다!' : '게임 끝!';
+  $('#end-winner').textContent = w ? `🏆 우승: ${w.emoji} ${w.name} (${w.total}점)` : '';
+  const label = { survive: '생존', escape: '탈출', mission: '미션', gems: '보석', camp: '캠프', betray: '배신', ally: '동맹' };
+  $('#end-rows').innerHTML = r.rows.map((p, i) => {
+    const detail = Object.keys(label).filter((k) => p.parts[k] > 0).map((k) => `${label[k]} +${p.parts[k]}`).join(' · ');
+    return `<div class="rank ${i === 0 ? 'first' : ''}"><div class="no">${medals[i] || i + 1}</div>
+      <div class="who">${p.emoji} ${esc(p.name)}${p.pid === pid ? ' (나)' : ''}<small>🎯 ${esc(p.mission)} ${p.missionDone ? '✅' : '❌'}</small><small>${detail || '득점 없음'}</small></div>
+      <div class="pt">${p.total}</div></div>`;
+  }).join('');
+  const isHost = r.host === pid;
+  $('#btn-rematch').classList.toggle('hidden', !isHost);
+  $('#end-wait').classList.toggle('hidden', isHost);
+}
+
+// ---------- 그리기 ----------
+const cv = $('#cv'), ctx = cv.getContext('2d');
+const mini = $('#mini'), mctx = mini.getContext('2d');
+let vw = innerWidth, vh = innerHeight, dpr = 1;
+function resize() {
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  vw = innerWidth; vh = innerHeight;
+  cv.width = Math.round(vw * dpr); cv.height = Math.round(vh * dpr);
+}
+addEventListener('resize', resize);
+addEventListener('orientationchange', () => setTimeout(resize, 200));
+resize();
+
+function rr(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+}
+function emo(c, ch, x, y, size) { c.font = `${size}px sans-serif`; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(ch, x, y); }
+
+let last = performance.now();
+let tAnim = 0;
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now; tAnim += dt;
+  if (playing && S && cfg) { try { draw(dt); } catch (e) { console.error(e); } }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function draw(dt) {
+  const k = 1 - Math.exp(-dt * 14);
+  for (const q of pos.values()) { q.x += (q.tx - q.x) * k; q.y += (q.ty - q.y) * k; }
+  const me = meP();
+  const alive = me && me.a;
+  let focus = pos.get(pid);
+  if (!alive) {
+    if (!specPid || !pos.get(specPid)) { const a = S.players.find((p) => p.a && pos.get(p.id)); specPid = a ? a.id : null; }
+    focus = specPid ? pos.get(specPid) : null;
+  }
+  if (focus) { cam.x += (focus.x - cam.x) * Math.min(1, dt * 10); cam.y += (focus.y - cam.y) * Math.min(1, dt * 10); }
+  const sc = Math.max(0.55, Math.min(1.4, Math.min(vw, vh) / 560));
+  const { W, H, CAMP, DOCK, zones } = cfg;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#6fd3f2'; ctx.fillRect(0, 0, vw, vh);
+  ctx.save();
+  ctx.translate(vw / 2 - cam.x * sc, vh / 2 - cam.y * sc);
+  ctx.scale(sc, sc);
+
+  // 바다 물결
+  ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 3;
+  for (let i = 0; i < 14; i++) {
+    const wx = ((i * 337) % (W + 600)) - 300, wy = ((i * 211) % (H + 600)) - 300 + Math.sin(tAnim + i) * 6;
+    ctx.beginPath(); ctx.arc(wx, wy, 26, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke();
+  }
+  // 섬
+  ctx.fillStyle = '#f6e7b0'; rr(ctx, -22, -22, W + 44, H + 44, 120); ctx.fill();
+  ctx.fillStyle = '#c9f0a3'; rr(ctx, 0, 0, W, H, 100); ctx.fill();
+  for (const key of Object.keys(zones)) {
+    const z = zones[key];
+    ctx.fillStyle = ZONE_COLOR[key]; rr(ctx, z.x, z.y, z.w, z.h, key === 'hazard' ? 60 : 80); ctx.fill();
+    ctx.globalAlpha = 0.22; emo(ctx, z.emoji, z.x + z.w / 2, z.y + z.h / 2, 150); ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(70,50,110,.55)'; ctx.font = 'bold 26px sans-serif'; ctx.textAlign = 'center'; ctx.fillText(z.name, z.x + z.w / 2, z.y + 34);
+  }
+  if (S.volcano) { ctx.fillStyle = 'rgba(255,70,0,.35)'; const z = zones.hazard; rr(ctx, z.x - 150, z.y - 150, z.w + 300, z.h + 300, 120); ctx.fill(); }
+  // 캠프
+  ctx.fillStyle = '#ffe9b8'; ctx.beginPath(); ctx.arc(CAMP.x, CAMP.y, 150, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#ffb347'; ctx.lineWidth = 5; ctx.stroke();
+  ctx.setLineDash([14, 12]); ctx.strokeStyle = 'rgba(46,160,90,.7)'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.arc(CAMP.x, CAMP.y, S.camp.safe, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+  emo(ctx, '🏕️', CAMP.x, CAMP.y - 6, 70);
+  ctx.fillStyle = '#6b3fd1'; ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'center'; ctx.fillText(`캠프 Lv.${S.camp.lv}`, CAMP.x, CAMP.y + 56);
+  // 선착장
+  emo(ctx, S.ship.active ? '🚢' : '⚓', DOCK.x, DOCK.y, 64);
+  ctx.fillStyle = '#2f8ad0'; ctx.font = 'bold 20px sans-serif'; ctx.fillText(S.ship.active ? `탈출선 ${S.ship.boarded}/${S.ship.seats}` : '선착장', DOCK.x, DOCK.y + 48);
+
+  // 함정
+  for (const t of S.traps) { ctx.globalAlpha = 0.9; emo(ctx, '🪤', t.x, t.y, 30); ctx.globalAlpha = 1; }
+  // 자원
+  const pad = 60;
+  const x0 = cam.x - vw / 2 / sc - pad, x1 = cam.x + vw / 2 / sc + pad, y0 = cam.y - vh / 2 / sc - pad, y1 = cam.y + vh / 2 / sc + pad;
+  for (const n of nodes) {
+    if (n[2] < x0 || n[2] > x1 || n[3] < y0 || n[3] > y1) continue;
+    if (n[1] === 'chest' || n[1] === 'gem') { ctx.fillStyle = 'rgba(255,240,120,.55)'; ctx.beginPath(); ctx.arc(n[2], n[3], 24 + Math.sin(tAnim * 4) * 3, 0, 7); ctx.fill(); }
+    emo(ctx, NODE_E[n[1]], n[2], n[3], n[1] === 'wood' ? 40 : 32);
+  }
+  // 운석 경고
+  for (const m of S.meteors) {
+    ctx.fillStyle = `rgba(255,60,60,${0.18 + 0.15 * Math.sin(tAnim * 12)})`; ctx.beginPath(); ctx.arc(m.x, m.y, 70, 0, 7); ctx.fill();
+    ctx.strokeStyle = '#e0243f'; ctx.lineWidth = 4; ctx.stroke();
+    emo(ctx, '☄️', m.x, m.y - Math.max(0, m.left) * 60, 40);
+  }
+  for (const b of S.boars) emo(ctx, '🐗', b.x, b.y, 44);
+
+  // 플레이어
+  const list = S.players.filter((p) => p.a && pos.get(p.id)).sort((a, b) => pos.get(a.id).y - pos.get(b.id).y);
+  for (const p of list) {
+    const q = pos.get(p.id);
+    if (p.al) { ctx.strokeStyle = '#2ea05a'; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(q.x, q.y, 28, 0, 7); ctx.stroke(); }
+    if (p.id === pid) { ctx.fillStyle = 'rgba(255,255,255,.5)'; ctx.beginPath(); ctx.arc(q.x, q.y + 4, 27, 0, 7); ctx.fill(); }
+    if (p.sh) { ctx.fillStyle = 'rgba(90,184,255,.35)'; ctx.strokeStyle = '#5ab8ff'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(q.x, q.y, 34, 0, 7); ctx.fill(); ctx.stroke(); }
+    emo(ctx, p.e, q.x, q.y, 42);
+    ctx.font = 'bold 15px sans-serif'; ctx.textAlign = 'center';
+    const label = `${p.bt ? '😈' : ''}${p.n}`;
+    ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(255,255,255,.9)'; ctx.strokeText(label, q.x, q.y - 40);
+    ctx.fillStyle = p.bt ? '#d4193f' : '#3b3355'; ctx.fillText(label, q.x, q.y - 40);
+    ctx.fillStyle = '#ffd9e3'; ctx.fillRect(q.x - 20, q.y + 26, 40, 5);
+    ctx.fillStyle = '#ff6f9b'; ctx.fillRect(q.x - 20, q.y + 26, 40 * p.hp / 100, 5);
+  }
+  ctx.restore();
+
+  // 날씨 오버레이
+  if (S.ev) {
+    const t = S.ev.type;
+    const tint = { storm: 'rgba(60,70,95,.28)', rain: 'rgba(70,110,170,.2)', fog: 'rgba(255,255,255,.4)', volcano: 'rgba(255,80,20,.12)' }[t];
+    if (tint) { ctx.fillStyle = tint; ctx.fillRect(0, 0, vw, vh); }
+    if (t === 'rain' || t === 'storm') {
+      ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.lineWidth = 2; ctx.beginPath();
+      for (let i = 0; i < 70; i++) { const rx = ((i * 97 + tAnim * 500) % (vw + 100)), ry = ((i * 53 + tAnim * 900) % vh); ctx.moveTo(rx, ry); ctx.lineTo(rx - 8, ry + 22); }
+      ctx.stroke();
+    }
+  }
+  // 밤 / 안개 시야 제한
+  if (alive) {
+    const fog = S.ev && S.ev.type === 'fog';
+    const night = S.phase === 'night';
+    if (night || fog) {
+      const R = (fog ? 170 : 220) * sc;
+      const fx = vw / 2 + (pos.get(pid).x - cam.x) * sc, fy = vh / 2 + (pos.get(pid).y - cam.y) * sc;
+      const g = ctx.createRadialGradient(fx, fy, R * 0.45, fx, fy, R);
+      const col = fog && !night ? '215,225,235' : '8,12,45';
+      g.addColorStop(0, `rgba(${col},0)`); g.addColorStop(1, `rgba(${col},${fog && !night ? 0.9 : 0.93})`);
+      ctx.fillStyle = g; ctx.fillRect(0, 0, vw, vh);
+    }
+  }
+  drawMini(me);
+}
+
+function drawMini(me) {
+  const { W, H, CAMP, DOCK, zones } = cfg;
+  const mw = mini.width, mh = mini.height, sx = mw / W, sy = mh / H;
+  mctx.fillStyle = '#6fd3f2'; mctx.fillRect(0, 0, mw, mh);
+  mctx.fillStyle = '#c9f0a3'; mctx.fillRect(2, 2, mw - 4, mh - 4);
+  for (const key of Object.keys(zones)) { const z = zones[key]; mctx.fillStyle = ZONE_COLOR[key]; mctx.fillRect(z.x * sx, z.y * sy, z.w * sx, z.h * sy); }
+  mctx.fillStyle = '#ffb347'; mctx.beginPath(); mctx.arc(CAMP.x * sx, CAMP.y * sy, 150 * sx, 0, 7); mctx.fill();
+  mctx.fillStyle = '#2f8ad0'; mctx.fillRect(DOCK.x * sx - 3, DOCK.y * sy - 3, 6, 6);
+  for (const m of S.meteors) { mctx.fillStyle = 'rgba(224,36,63,.8)'; mctx.beginPath(); mctx.arc(m.x * sx, m.y * sy, 4, 0, 7); mctx.fill(); }
+  for (const p of S.players) {
+    if (!p.a) continue;
+    const q = pos.get(p.id); if (!q) continue;
+    if (p.id !== pid && !p.al && me && me.a) continue;
+    mctx.fillStyle = p.id === pid ? '#ffffff' : (p.al ? '#2ea05a' : '#8a6cf0');
+    mctx.strokeStyle = '#3b3355'; mctx.lineWidth = 1;
+    mctx.beginPath(); mctx.arc(q.x * sx, q.y * sy, p.id === pid ? 4 : 3, 0, 7); mctx.fill(); mctx.stroke();
+  }
+}
+
+// 접속 직후 저장된 방이 있으면 서버가 상태를 보내줄 때까지 대기 화면 유지
+screen('menu');
+})();
